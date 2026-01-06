@@ -9,6 +9,7 @@
 //   - 指定ディレクトリ以下の全Dartファイルを再帰的に検索
 //   - 括弧のネストを正確に処理
 //   - 改行を含む複数行のパターンにも対応
+//     (例: `ref\n  .read(xxxProvider.future)`)
 //   - 指定されたインポート文を自動追加
 //   - ドライランモードで変更内容を事前確認可能
 //
@@ -247,10 +248,11 @@ FileResult? processFile(File file, Config config) {
 
   for (final match in sortedMatches) {
     // ref.read を ref.<method> に置換
+    // 改行がある場合も考慮して、.read( を .<method>( に置換
     final original = match.text;
     final replaced = original.replaceFirst(
-      'ref.read(',
-      'ref.${config.methodName}(',
+      RegExp(r'\.read\('),
+      '.${config.methodName}(',
     );
     content =
         content.substring(0, match.startOffset) +
@@ -280,16 +282,26 @@ FileResult? processFile(File file, Config config) {
 // =============================================================================
 
 /// ファイル内容から `ref.read(xxxProvider.future)` パターンを全て検索する
+/// `ref` と `.read(` の間に改行や空白がある場合にも対応
 List<Match> findRefReadFuture(String content) {
   final results = <Match>[];
-  const pattern = 'ref.read(';
+  const refPattern = 'ref';
   var index = 0;
 
   while (true) {
-    final start = content.indexOf(pattern, index);
-    if (start == -1) break;
+    // 'ref' を検索
+    final refStart = content.indexOf(refPattern, index);
+    if (refStart == -1) break;
 
-    final parenStart = start + pattern.length - 1;
+    // 'ref' の後に空白/改行/ドットをスキップして '.read(' を探す
+    final readStart = findReadAfterRef(content, refStart);
+    if (readStart == -1) {
+      index = refStart + 1;
+      continue;
+    }
+
+    // 開き括弧の位置を取得
+    final parenStart = readStart + '.read('.length - 1;
     final parenEnd = findMatchingParen(content, parenStart);
 
     if (parenEnd != -1) {
@@ -297,24 +309,59 @@ List<Match> findRefReadFuture(String content) {
 
       // 括弧内が '.future' で終わっているかチェック
       if (RegExp(r'\.future\s*,?\s*$').hasMatch(inside)) {
-        final matchText = content.substring(start, parenEnd + 1);
-        final line = getLineNumber(content, start);
+        final matchText = content.substring(refStart, parenEnd + 1);
+        final line = getLineNumber(content, refStart);
 
         results.add(
           Match(
             line: line,
             text: matchText,
-            startOffset: start,
+            startOffset: refStart,
             endOffset: parenEnd + 1,
           ),
         );
       }
     }
 
-    index = start + 1;
+    index = refStart + 1;
   }
 
   return results;
+}
+
+/// 'ref' の後に空白/改行/ドットをスキップして '.read(' を探す
+/// 見つかった場合は '.read(' の開始位置を返す、見つからなければ -1
+int findReadAfterRef(String content, int refStart) {
+  // 'ref' の終了位置
+  final refEnd = refStart + 'ref'.length;
+
+  // 範囲チェック
+  if (refEnd >= content.length) return -1;
+
+  var i = refEnd;
+
+  // 空白、改行、ドットをスキップ
+  while (i < content.length) {
+    final char = content[i];
+    if (char == ' ' || char == '\t' || char == '\n' || char == '\r') {
+      i++;
+    } else if (char == '.') {
+      // ドットが見つかったら、その後に 'read(' があるかチェック
+      if (i + 'read('.length < content.length) {
+        final nextPart = content.substring(i + 1, i + 1 + 'read('.length);
+        if (nextPart == 'read(') {
+          return i; // '.read(' の開始位置（ドットの位置）
+        }
+      }
+      // ドットの後に 'read(' がない場合は終了
+      return -1;
+    } else {
+      // 期待しない文字が見つかった場合は終了
+      return -1;
+    }
+  }
+
+  return -1;
 }
 
 /// 対応する閉じ括弧の位置を返す（見つからなければ -1）
@@ -432,8 +479,8 @@ void outputResults(List<FileResult> results, Config config) {
     for (final match in result.matches) {
       final singleLineText = match.text.replaceAll(RegExp(r'\s+'), ' ').trim();
       final replacedText = singleLineText.replaceFirst(
-        'ref.read(',
-        'ref.${config.methodName}(',
+        RegExp(r'\.read\('),
+        '.${config.methodName}(',
       );
       print('  - `$singleLineText` → `$replacedText` (L${match.line})');
     }
